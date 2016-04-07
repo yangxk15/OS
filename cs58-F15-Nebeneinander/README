@@ -1,0 +1,233 @@
+README - Nebeneinander Yalnix
+
+PHYSICAL MEMORY MANAGEMENT
+	To keep track of which frames are free, the first address in each
+	free frame stores an integer of the next free frame. The head
+	of this linked list is stored as a whole page, directly below the
+	kernel stack.
+
+	When it comes time to assign a free frame to a page, the intermediary
+	frame below the stack gives up it's frame to the necessary PTE, and
+	and then takes in the frame whose number was stored previously stored
+	in the intermediary.
+
+	There is no paging to disk, so when there are no more free frames,
+	any function that asks for them will return a failure code. The 
+	kernel itself will continue to idle indefinitely, even if it runs out of
+	frames and all the processes running need more frames to continue.
+	It will even keep going if most of the processes crash due to lack of
+	memory, except for the initial process, which will halt the machine if
+	it exits.
+
+
+PCB DATA STRUCTURE
+
+	As each new process is created, it is assigned a pid, incremented by
+	one from the last pid issued.
+	
+	It also inherits a user/kernelcontext from either the hardware or it's
+	parent process.
+	
+	The process's page table is embedded in the PCB, as it is a necessary
+	part of any process, it makes sense to have it contiguous and easily 
+	malloc'd/freed with the PCB.
+
+	Each pcb has it's own kernel stack frames, which it keeps track of in
+	ksframes. This is the only record of these frames when the pcb is not
+	the currently active process.
+
+	Each pcb has the following pointers to relate to other pcbs
+		1) parent pointer
+		2) child pointer
+		3) sibling pointer
+	These pointers constitute a "Left-child right-sibling binary tree"
+	where each pcb has at most one child directly linked to it
+	and other children are connected by sibling links to the 
+	initial child. When a process is orphaned, it becomes the root of
+	own tree. There currently no way to traverse all processes,
+	except by going through the various queue's they get stored in
+	when not active.
+
+	For using PCBs in linked-lists & queues, we elected to
+	use the 'Linux' model, i.e: a queue node embedded in the
+	pcb struct.
+
+	Each PCB also has a number of book keeping fields:
+		stackBase, brk, userDataEnd delimit the segments in userspace.
+		timer is an int that is currently used for Delay
+			but it could be used for any other function
+			as long as a process would not be in Delay and
+			that function concurrently.
+		waitingOnChild is a simple flag with
+				0 = not waiting
+				1 = waiting
+			for a single child to exit and hand over a status
+		childExitStatus is a queue, for the opposite case from
+			waitingOnChild. More in the section below.
+
+EXIT / WAIT: ZOMBIE PROCESSES
+	When a process exits, it checks if it is an orphan.
+	If it is an orphan, it dies and does nothing with it's status.
+	If it has a living parent, then it makes what may be called
+	a 'zombie process', but in our case is more like a record
+	of having lived. This record is a struct called an ExitStatus, which
+	has three components:
+		pid: 		the dying child's pid
+		status: 	the actual exit status
+		queue_node:	the queue node, same as in PCB
+	Each process has a Queue struct called childExitStatus in its PCB.
+	As an unorphaned process dies, it enqueues this ExitStatus in
+	it's parent's childExitStatus queue.
+
+	When a parent calls wait, if it has a child, it flips the flag
+	'waitingOnChild' to WAITING, and then context switches to the
+	ready queue. This is possibly the only time a PCB is not enqueued
+	in some queue and not the active process at the same time.
+	It therefore is only found by being in the PCB tree structure.
+	
+	When a child dies, it checks its parent's flag to see if it is waiting
+	and enqueues it's parent in the ready queue. 
+
+IPC TABLE STRUCTURE
+ 	All inter process communication structures come with an
+ 	ObjectNode, all of which are stored in ipc_table;
+ 
+ 	ipc_table functions as a hash table, though the hash
+	function is simple (h(x) = x % ipc_table length)
+
+	This is appropriate, because although the hash is not
+ 	random, which objects get removed over time is unknown
+ 	and subject to user whims, and thus can be considered 
+ 	pseudo-random.
+	
+	Hash table is dynamically resized based on load factor.
+	Actual resizing parameters defined in inter_process_com.h,
+	and can be easily changed, as the current definitions are 
+	solely based on the authors' best guesses.
+	
+	After an ipc object has been reclaimed, all processes
+	waiting on that object are put back in the ready queue
+	If they try to interact with the object further,
+	they will receive the return code ERROR.
+
+	Pipe:
+		Pipe data structure:
+			* read_queue is a queue in which process waiting
+			to read saved its PCB.
+			* write_queue is a queue in which process waiting
+			to write saved its PCB.
+			* buf is defined as the buffer of PIPE_MAX_LENGTH
+			to save the bytes written and write.
+			* start and end are two integer pointers indicating
+			the start index and the end index of the buffer:
+				start_index: start % PIPE_MAX_LENGTH;
+				  end_index: end   % PIPE_MAX_LENGTH;
+			* object_node is for the ipc_table data structure.
+		KernelPipeInit:
+			Create a new pipe;
+			save its identifier at *pipe idp;
+			In case of any error, the value ERROR is returned.
+		KernelPipeRead:
+			Read len consecutive bytes from the named pipe
+			into the buffer starting at address buf;
+			Block the caller until these bytes are available;
+			In case of any error, the value ERROR is returned;
+			Otherwise, return the number of bytes read.
+		KernelPipeWrite:
+			Write the len bytes starting at buf to the named pipe;
+			Block the called until these bytes all these bytes
+			have been successfully written.
+			Return when this write is complete;
+			In case of any error, the value ERROR is returned;
+			Otherwise, return the number of bytes written.
+	Lock:
+		Data Structure
+			*state: 	busy / idle
+			*holder_pid: 	pid of the current owner
+			*acquire_queue:	queue of processes waiting to acquire
+			*object_node:	for ipc_table data structure 
+		KernelLockInit:
+			Initializes lock and returns id to user
+		KernelAcquire:
+			Try to acquire lock
+			Return error if it is already owned by current process
+			Get in acquire queue if otherwise busy
+		KernelRelease:
+			Return error if lock not owned by current process
+			otherwise change state and holder_pid
+			and if there is somebody in acquire_queue
+			put them in ready queue
+	Cvar:
+		Data Structure
+			*wait_queue:	queue of processes waiting on cvar
+			*object_node	for ipc_table data structure
+		KernelCvarInit:
+			Initializes cvar and returns id to user
+		KernelCvarSignal:
+			Puts first member of wait_queue in ready queue	
+		KernelCvarBroadcast:
+			Puts everyone in wait_queue in ready queue
+		KernelCvarWait:
+			Releases lock, blocks in wait queue, then reaquires lock
+	Semaphore:
+		Graduate credit implementation
+		Data strucutre
+			*value:		the number of available 'flags'
+			*down_queue	processes waiting to take a flag
+			*object_node	for ipc_table data structure
+		KernelSemInit:
+			 Initialize Semaphore
+			sem_idp:	pointer to userland int, place to store id
+			start_val:	initial number of 'flags'
+		KernelSemUp:
+			Increase number of available flags
+ 			After making a flag available
+			if there is a process waiting for a flag
+			put that flag in the ready queue.
+		KernelSemDown:
+ 			Decrease number of flags
+			If there are no available flags
+ 			wait in the 'down_queue' until somebody calls KernelSemUp
+ 			Else, take a flag
+ 
+TTY DATA STRUCTURES
+	Each terminal 'ttyid' requires three queues:
+	BufferQueues[ttyid]:
+		A queue of 'TtyBuffers', which are structs that contain
+			a buffer of size TERMINAL_MAX_SIZE
+			an int to hold the actual length the buffer holds
+			a queue node of the same type as used in PCBs
+		These buffer queues are populated by TrapTtyReceiveHandler,
+		and are depopulated by KernelTtyRead.
+		All input must be caught and put in these buffers.
+	ReceiveQueue[ttyid]:
+		A queue of processes waiting for input buffers from ttyid.
+		Only the head of this queue can read from ttyid.
+		When a new buffer is enqueued in BufferQueues[ttyid],
+		the trap handler will switch contexts to whichever
+		process is at the head of this queue, if there is anyone.
+	TransmitQueue[ttyid]:
+		A queue of processes waiting to transmit. The head is waiting
+		for it's transmission to return. Only the head can transmit.
+		TrapTtyTransmitHandler can assume that the appropriate process
+		is still in the head, because this is the only function that
+		switches contexts back to the head.
+
+	These structures assume that the number of terminals remains constant
+	Any deviation from this assumption will have undefined results.
+
+CONTEXT SWITCHING
+	There are three context switching functions.
+	KCKSInit
+		Copies the current pcb's kernel stack frames and context
+		to a new process. Does not actually switch.
+	KCSwitch
+		Normal switch function.
+	KCKSFree
+		Sort of the opposite of KCKSInit, but with more responsibility
+		Returns all process-specific frames to the linked list of
+		free frames, and frees the PCB. Those things were originally
+		allocated outside of KCKSInit.
+		Only works on current process, so it does actually switch 
+		to the next process. 
+
