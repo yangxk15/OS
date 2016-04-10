@@ -176,7 +176,7 @@ int main(int argc, char * argv[]) {
 	if (NULL == file) {
 		printf("%s Writing error!!!");
 		exit(-1);
-  }
+  	}
 	
 	fprintf(file, "<html>\n");
 	fprintf(file, "<head> <title> Album Index </title> </head>\n");
